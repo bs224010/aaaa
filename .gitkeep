@@ -1,0 +1,548 @@
+#!/usr/bin/env python3
+"""
+Simple LLM bottleneck measurement for one local LLM on one GPU.
+
+Purpose:
+- Measure prefill throughput.
+- Measure decode throughput at different context depths.
+- Approximate RAG effect by increasing prompt/context length.
+- Log GPU utilization, VRAM usage, and power via nvidia-smi.
+- Estimate simple "bytes per generated token" for a communication-limit model.
+
+Assumed model example:
+- Qwen2.5-7B-Instruct GGUF
+- llama.cpp / llama-bench
+- RTX 3060 class GPU
+
+Example:
+python measure_llm_simple.py \
+  --llama-bench ./build/bin/llama-bench \
+  --model ./models/Qwen2.5-7B-Instruct-Q4_K_M.gguf \
+  --prompts 512,1024,2048,4096 \
+  --ngl=-1 \
+  --flash-attn auto
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import io
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Dict, List, Optional
+
+
+# Qwen2.5-7B-Instruct rough KV cache constants.
+# If you use another single LLM, adjust these.
+QWEN25_7B_LAYERS = 28
+QWEN25_7B_KV_HEADS = 4
+HEAD_DIM = 128
+KV_DTYPE_BYTES = 2  # f16
+
+
+def parse_int_list(s: str) -> List[int]:
+    return [int(x.strip()) for x in s.split(",") if x.strip()]
+
+
+def parse_str_list(s: str) -> List[str]:
+    return [x.strip() for x in s.split(",") if x.strip()]
+
+
+def extract_float(s: str) -> Optional[float]:
+    if s is None:
+        return None
+    m = re.search(r"[-+]?\d+(\.\d+)?", str(s))
+    if not m:
+        return None
+    return float(m.group(0))
+
+
+def safe_int(x, default: int = 0) -> int:
+    try:
+        return int(float(str(x)))
+    except Exception:
+        return default
+
+
+def safe_float(x, default: float = 0.0) -> float:
+    try:
+        return float(str(x))
+    except Exception:
+        return default
+
+
+def kv_bytes_per_token() -> int:
+    """
+    KV cache per token:
+    2 for K and V
+    * layers
+    * kv_heads
+    * head_dim
+    * bytes per value
+    """
+    return (
+        2
+        * QWEN25_7B_LAYERS
+        * QWEN25_7B_KV_HEADS
+        * HEAD_DIM
+        * KV_DTYPE_BYTES
+    )
+
+
+def find_executable(path_or_name: str) -> str:
+    p = Path(path_or_name)
+    if p.exists():
+        return str(p)
+    found = shutil.which(path_or_name)
+    if found:
+        return found
+    raise FileNotFoundError(f"Executable not found: {path_or_name}")
+
+
+def start_gpu_log(out_path: Path, interval_ms: int) -> Optional[subprocess.Popen]:
+    """
+    Start nvidia-smi CSV logging.
+
+    If nvidia-smi is unavailable, return None.
+    """
+    if shutil.which("nvidia-smi") is None:
+        print("WARN: nvidia-smi not found. GPU log will be skipped.", file=sys.stderr)
+        return None
+
+    cmd = [
+        "nvidia-smi",
+        "--query-gpu=timestamp,name,utilization.gpu,utilization.memory,"
+        "memory.used,memory.total,power.draw,temperature.gpu",
+        "--format=csv",
+        f"--loop-ms={interval_ms}",
+        "-f",
+        str(out_path),
+    ]
+
+    return subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def stop_process(proc: Optional[subprocess.Popen]) -> None:
+    if proc is None:
+        return
+
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
+
+
+def summarize_gpu_log(path: Path) -> Dict[str, float]:
+    """
+    Read nvidia-smi CSV and return simple aggregated metrics.
+    """
+    if not path.exists() or path.stat().st_size == 0:
+        return {}
+
+    with path.open("r", newline="", encoding="utf-8", errors="replace") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+
+    if not rows:
+        return {}
+
+    def values_by_key_substring(substr: str) -> List[float]:
+        key = None
+        for k in rows[0].keys():
+            if substr in k:
+                key = k
+                break
+        if key is None:
+            return []
+
+        vals = []
+        for r in rows:
+            v = extract_float(r.get(key, ""))
+            if v is not None:
+                vals.append(v)
+        return vals
+
+    gpu_util = values_by_key_substring("utilization.gpu")
+    mem_util = values_by_key_substring("utilization.memory")
+    mem_used = values_by_key_substring("memory.used")
+    power = values_by_key_substring("power.draw")
+    temp = values_by_key_substring("temperature.gpu")
+
+    summary = {}
+
+    if gpu_util:
+        summary["gpu_avg_util_pct"] = sum(gpu_util) / len(gpu_util)
+        summary["gpu_max_util_pct"] = max(gpu_util)
+
+    if mem_util:
+        summary["gpu_avg_mem_util_pct"] = sum(mem_util) / len(mem_util)
+        summary["gpu_max_mem_util_pct"] = max(mem_util)
+
+    if mem_used:
+        summary["gpu_avg_mem_used_mib"] = sum(mem_used) / len(mem_used)
+        summary["gpu_max_mem_used_mib"] = max(mem_used)
+
+    if power:
+        summary["gpu_avg_power_w"] = sum(power) / len(power)
+        summary["gpu_max_power_w"] = max(power)
+
+    if temp:
+        summary["gpu_avg_temp_c"] = sum(temp) / len(temp)
+        summary["gpu_max_temp_c"] = max(temp)
+
+    return summary
+
+
+def parse_llama_bench_csv(stdout: str) -> List[Dict[str, str]]:
+    """
+    llama-bench -o csv may still have surrounding logs depending on build.
+    Find CSV header and parse from there.
+    """
+    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+
+    start_idx = None
+    for i, line in enumerate(lines):
+        if line.startswith("build_commit,"):
+            start_idx = i
+            break
+
+    if start_idx is None:
+        raise ValueError("Could not find llama-bench CSV header in stdout.")
+
+    csv_lines = []
+    for line in lines[start_idx:]:
+        if "," in line:
+            csv_lines.append(line)
+
+    reader = csv.DictReader(io.StringIO("\n".join(csv_lines)))
+    return list(reader)
+
+
+def run_llama_bench(
+    llama_bench: str,
+    model: str,
+    phase: str,
+    prompt_tokens: int,
+    gen_tokens: int,
+    ngl: str,
+    flash_attn: str,
+    repeats: int,
+) -> List[str]:
+    """
+    phase:
+    - prefill: measure prompt processing with -p prompt_tokens -n 0 -d 0
+    - decode: measure generation with -p 0 -n gen_tokens -d prompt_tokens
+    """
+    cmd = [
+        llama_bench,
+        "-m",
+        model,
+        "-ngl",
+        ngl,
+        "-o",
+        "csv",
+        "-r",
+        str(repeats),
+        "-fa",
+        flash_attn,
+    ]
+
+    if phase == "prefill":
+        cmd += ["-p", str(prompt_tokens), "-n", "0", "-d", "0"]
+    elif phase == "decode":
+        cmd += ["-p", "0", "-n", str(gen_tokens), "-d", str(prompt_tokens)]
+    else:
+        raise ValueError(f"Unknown phase: {phase}")
+
+    return cmd
+
+
+def enrich_row(
+    row: Dict[str, str],
+    run_id: str,
+    phase: str,
+    prompt_tokens_like_rag: int,
+    ngl: str,
+    flash_attn: str,
+    cmd: List[str],
+    gpu_summary: Dict[str, float],
+    mem_bandwidth_gbs: float,
+    bandwidth_efficiency: float,
+) -> Dict[str, object]:
+    """
+    Add communication-model estimates to llama-bench row.
+    """
+    out: Dict[str, object] = {}
+
+    out["run_id"] = run_id
+    out["phase_requested"] = phase
+    out["prompt_tokens_like_rag"] = prompt_tokens_like_rag
+    out["n_gpu_layers_requested"] = ngl
+    out["flash_attn_requested"] = flash_attn
+
+    # Keep key llama-bench fields.
+    keep_fields = [
+        "gpu_info",
+        "backends",
+        "model_filename",
+        "model_type",
+        "model_size",
+        "model_n_params",
+        "n_prompt",
+        "n_gen",
+        "n_depth",
+        "n_gpu_layers",
+        "flash_attn",
+        "avg_ns",
+        "stddev_ns",
+        "avg_ts",
+        "stddev_ts",
+        "type_k",
+        "type_v",
+    ]
+
+    for k in keep_fields:
+        out[k] = row.get(k, "")
+
+    n_depth = safe_int(row.get("n_depth", 0))
+    n_gen = safe_int(row.get("n_gen", 0))
+    model_size_bytes = safe_int(row.get("model_size", 0))
+    actual_tps = safe_float(row.get("avg_ts", 0.0))
+
+    kv_bpt = kv_bytes_per_token()
+    kv_context_bytes = kv_bpt * n_depth
+
+    out["kv_bytes_per_token"] = kv_bpt
+    out["kv_cache_mb_at_depth"] = kv_context_bytes / (1024**2)
+
+    # Simple decode communication estimate.
+    # Very rough:
+    # per generated token bytes ~= model weights read + KV read for current depth + KV write for new token.
+    if n_gen > 0 and model_size_bytes > 0:
+        estimated_bytes_per_generated_token = model_size_bytes + kv_context_bytes + kv_bpt
+        estimated_gb_per_generated_token = estimated_bytes_per_generated_token / 1e9
+
+        usable_bw_bytes_s = mem_bandwidth_gbs * 1e9 * bandwidth_efficiency
+        pred_tps = usable_bw_bytes_s / estimated_bytes_per_generated_token
+
+        effective_bw_from_actual_gbs = (
+            actual_tps * estimated_bytes_per_generated_token / 1e9
+            if actual_tps > 0
+            else 0.0
+        )
+
+        out["estimated_decode_gb_per_token"] = estimated_gb_per_generated_token
+        out["pred_tps_mem_model"] = pred_tps
+        out["effective_bw_from_actual_gbs"] = effective_bw_from_actual_gbs
+    else:
+        out["estimated_decode_gb_per_token"] = ""
+        out["pred_tps_mem_model"] = ""
+        out["effective_bw_from_actual_gbs"] = ""
+
+    for k, v in gpu_summary.items():
+        out[k] = v
+
+    out["cmd"] = " ".join(cmd)
+    return out
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--llama-bench", required=True, help="Path to llama-bench")
+    parser.add_argument("--model", required=True, help="Path to GGUF model")
+    parser.add_argument(
+        "--prompts",
+        default="512,1024,2048,4096",
+        help="Comma-separated prompt/context sizes. This approximates RAG context size.",
+    )
+    parser.add_argument(
+        "--ngl",
+        default="-1",
+        help=(
+            "Comma-separated n_gpu_layers values. "
+            "Use --ngl=-1 for all GPU. Example: --ngl=-1,20,10"
+        ),
+    )
+    parser.add_argument("--gen", type=int, default=128, help="Generated tokens for decode test")
+    parser.add_argument("--repeats", type=int, default=3, help="llama-bench repetitions")
+    parser.add_argument(
+        "--flash-attn",
+        default="auto",
+        choices=["auto", "on", "off"],
+        help="llama.cpp FlashAttention setting",
+    )
+    parser.add_argument("--outdir", default="results_llm_measure")
+    parser.add_argument(
+        "--mem-bandwidth-gbs",
+        type=float,
+        default=360.0,
+        help="Nominal VRAM bandwidth in GB/s. RTX 3060 12GB is often treated around 360 GB/s.",
+    )
+    parser.add_argument(
+        "--bandwidth-efficiency",
+        type=float,
+        default=0.55,
+        help="Assumed effective bandwidth ratio for rough prediction.",
+    )
+    parser.add_argument("--gpu-log-ms", type=int, default=500)
+
+    args = parser.parse_args()
+
+    llama_bench = find_executable(args.llama_bench)
+    model = str(Path(args.model))
+
+    if not Path(model).exists():
+        raise FileNotFoundError(f"Model not found: {model}")
+
+    prompts = parse_int_list(args.prompts)
+    ngl_values = parse_str_list(args.ngl)
+
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    all_rows: List[Dict[str, object]] = []
+
+    for ngl in ngl_values:
+        for p in prompts:
+            for phase in ["prefill", "decode"]:
+                run_id = f"{int(time.time())}_ngl{ngl}_p{p}_{phase}".replace("-", "m")
+
+                gpu_log_path = outdir / f"{run_id}_gpu.csv"
+                stdout_path = outdir / f"{run_id}_stdout.csv"
+                stderr_path = outdir / f"{run_id}_stderr.txt"
+
+                cmd = run_llama_bench(
+                    llama_bench=llama_bench,
+                    model=model,
+                    phase=phase,
+                    prompt_tokens=p,
+                    gen_tokens=args.gen,
+                    ngl=ngl,
+                    flash_attn=args.flash_attn,
+                    repeats=args.repeats,
+                )
+
+                print(f"\nRUN: {run_id}")
+                print("CMD:", " ".join(cmd))
+
+                gpu_proc = start_gpu_log(gpu_log_path, args.gpu_log_ms)
+                time.sleep(1.0)
+
+                proc = subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+
+                stop_process(gpu_proc)
+
+                stdout_path.write_text(proc.stdout, encoding="utf-8", errors="replace")
+                stderr_path.write_text(proc.stderr, encoding="utf-8", errors="replace")
+
+                if proc.returncode != 0:
+                    print(f"ERROR: llama-bench failed. See {stderr_path}", file=sys.stderr)
+                    continue
+
+                try:
+                    rows = parse_llama_bench_csv(proc.stdout)
+                except Exception as e:
+                    print(f"ERROR: CSV parse failed: {e}", file=sys.stderr)
+                    print(f"See stdout: {stdout_path}", file=sys.stderr)
+                    continue
+
+                gpu_summary = summarize_gpu_log(gpu_log_path)
+
+                for row in rows:
+                    enriched = enrich_row(
+                        row=row,
+                        run_id=run_id,
+                        phase=phase,
+                        prompt_tokens_like_rag=p,
+                        ngl=ngl,
+                        flash_attn=args.flash_attn,
+                        cmd=cmd,
+                        gpu_summary=gpu_summary,
+                        mem_bandwidth_gbs=args.mem_bandwidth_gbs,
+                        bandwidth_efficiency=args.bandwidth_efficiency,
+                    )
+                    all_rows.append(enriched)
+
+    if not all_rows:
+        print("No successful rows.")
+        return
+
+    summary_path = outdir / "summary.csv"
+
+    preferred_cols = [
+        "run_id",
+        "phase_requested",
+        "prompt_tokens_like_rag",
+        "n_gpu_layers_requested",
+        "flash_attn_requested",
+        "gpu_info",
+        "backends",
+        "model_type",
+        "model_size",
+        "model_n_params",
+        "n_prompt",
+        "n_gen",
+        "n_depth",
+        "n_gpu_layers",
+        "flash_attn",
+        "type_k",
+        "type_v",
+        "avg_ts",
+        "stddev_ts",
+        "avg_ns",
+        "stddev_ns",
+        "kv_bytes_per_token",
+        "kv_cache_mb_at_depth",
+        "estimated_decode_gb_per_token",
+        "pred_tps_mem_model",
+        "effective_bw_from_actual_gbs",
+        "gpu_avg_util_pct",
+        "gpu_max_util_pct",
+        "gpu_avg_mem_util_pct",
+        "gpu_max_mem_util_pct",
+        "gpu_avg_mem_used_mib",
+        "gpu_max_mem_used_mib",
+        "gpu_avg_power_w",
+        "gpu_max_power_w",
+        "gpu_avg_temp_c",
+        "gpu_max_temp_c",
+        "model_filename",
+        "cmd",
+    ]
+
+    all_keys = set()
+    for r in all_rows:
+        all_keys.update(r.keys())
+
+    fieldnames = preferred_cols + sorted(k for k in all_keys if k not in preferred_cols)
+
+    with summary_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(all_rows)
+
+    print(f"\nDONE: {summary_path}")
+    print("Open this CSV and compare avg_ts vs pred_tps_mem_model for decode rows.")
+
+
+if __name__ == "__main__":
+    main()
